@@ -1,0 +1,174 @@
+###
+#
+# Ansible playbook to setup a clean, fresh, server running a 
+# debian based distribution with some basic security and the 
+# verus daemon. Effectively a seednode
+# 
+###
+
+- name: Verus Seednode Playbook
+  hosts: <hostname>
+  become: true
+
+  tasks: 
+    # Install essential software for running Verus and basic server security
+    - name: Install essentials
+      apt:
+        pkg:
+          - build-essential
+          - vim
+          - gawk
+          - git
+          - wget
+          - ufw
+          - jq
+          - bc
+        state: latest
+        update_cache: true
+
+    - name: Create a regular user for running Verus
+      user:
+        name: verus
+        state: present
+        append: true
+        shell: /bin/bash
+        create_home: true
+    
+    - name: Set authorized key for remote user (root)
+      ansible.posix.authorized_key:
+        user: root
+        state: present
+        key: "{{ lookup('file', lookup('env', 'HOME') + '/.ssh/id_ed25519.pub') }}"
+    
+    - name: Disable password authentication for root
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        state: present
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin prohibit-password'
+
+    - name: UFW - Allow SSH connections
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: UFW - Allow Verusd
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        port: 27485
+        comment: "Verus Mainnet P2P"
+
+    - name: UFW - Enable and deny by default
+      community.general.ufw:
+        state: enabled
+        default: deny
+
+    - name: Get the latest Verus release from GitHub
+      uri:
+        url: "https://api.github.com/repos/veruscoin/veruscoin/releases/latest"
+        method: GET
+        return_content: yes
+        force_basic_auth: yes
+      register: json_response
+
+    - name: Save the latest release version
+      set_fact:
+        latest_release: "{{ json_response.json.tag_name }}"
+
+    - name: Parse JSON of git release
+      set_fact:
+        download_url: "{{ (json_response.json.assets | json_query(query))[0].browser_download_url }}"
+      vars:
+        query: "[?ends_with(name, '-x86_64.tgz')]"
+      
+    - name: Download the latest release
+      get_url:
+        url: "{{ download_url }}"
+        dest: "/home/verus/"
+      become: yes
+      become_user: verus
+
+    - name: Unarchive the tarball
+      unarchive:
+        src: "/home/verus/{{ download_url | basename }}"
+        dest: "/home/verus/"
+        remote_src: yes
+      become: yes
+      become_user: verus
+
+    - name: Parse json of extracted tarball
+      shell: "cat /home/verus/Verus-CLI-Linux-{{ latest_release }}-x86_64.tar.gz.signature.txt"
+      register: tarballsig
+
+    - name: Save JSON data to a variable as a fact
+      set_fact:
+        tarball_sig_data: "{{ tarballsig.stdout | from_json }}"
+
+    - name: Get sha256hash of downloaded tarball for verification
+      shell: 'sha256sum /home/verus/Verus-CLI-Linux-{{ latest_release }}-x86_64.tar.gz | cut -f1 -d" "'
+      register: sha256sum_result
+
+    - name: Save sha256sum as variable
+      set_fact:
+        sha256_tarball: "{{ sha256sum_result.stdout }}"
+
+    - name: Verify the downloaded tarball using api.verus.services
+      uri:
+        url: https://api.verus.services
+        method: POST
+        return_content: true
+        body_format: json
+        headers:
+          Content-Type: "text/plain"
+        body:
+          jsonrpc: "1.0"
+          id: "curltext"
+          method: "verifyhash"
+          params:
+            - "{{ tarball_sig_data.signer }}"
+            - "{{ tarball_sig_data.signature }}"
+            - "{{ sha256_tarball }}"
+      register: verify_response_raw
+
+    - name: Store verification response as variable
+      set_fact: 
+        verify_response: "{{ verify_response_raw.content | from_json }}"
+
+    - name: Proceed with extraction if verified
+      shell: 'tar -xzvf /home/verus/Verus-CLI-Linux-{{ latest_release }}-x86_64.tar.gz && mv verus-cli bin'
+      args:
+        chdir:
+          /home/verus
+      become: yes
+      become_user: verus
+      when: '{{ verify_response.result == true }}'
+
+    - meta: end_play
+      when: '{{ verify_response.result != true }}'
+
+    - name: Add bin to bashrc
+      shell: 'echo "export PATH=\${PATH}:/home/verus/bin" >> /home/verus/.bashrc'
+      become: yes
+      become_user: verus
+
+    - name: Fetch zcash parameters
+      shell: "/home/verus/bin/fetch-params"
+      become: yes
+      become_user: verus
+
+    - name: Fetch bootstrap
+      shell: |
+       (printf '\n1\n') | /home/verus/bin/fetch-bootstrap
+      become: yes
+      become_user: verus
+
+    - name: Start verus at startup via cron
+      cron:
+        name: "Autostart Verus"
+        special_time: reboot
+        user: verus
+        job: "cd /home/verus/bin; ./verusd -daemon &>/dev/null"
+
+    - name: Reboot after completion
+      ansible.builtin.reboot:
