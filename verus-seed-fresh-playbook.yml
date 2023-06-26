@@ -23,6 +23,7 @@
           - ufw
           - jq
           - bc
+          - tmux
         state: latest
         update_cache: true
 
@@ -70,15 +71,15 @@
         method: GET
         return_content: yes
         force_basic_auth: yes
-      register: json_response
+      register: git_release_response
 
     - name: Save the latest release version
       set_fact:
-        latest_release: "{{ json_response.json.tag_name }}"
+        latest_release: "{{ git_release_response.json.tag_name }}"
 
     - name: Parse JSON of git release
       set_fact:
-        download_url: "{{ (json_response.json.assets | json_query(query))[0].browser_download_url }}"
+        download_url: "{{ (git_release_response.json.assets | json_query(query))[0].browser_download_url }}"
       vars:
         query: "[?ends_with(name, '-x86_64.tgz')]"
       
@@ -134,6 +135,9 @@
     - name: Store verification response as variable
       set_fact: 
         verify_response: "{{ verify_response_raw.content | from_json }}"
+    
+    - meta: end_play
+      when: '{{ verify_response.result != true }}'
 
     - name: Proceed with extraction if verified
       shell: 'tar -xzvf /home/verus/Verus-CLI-Linux-{{ latest_release }}-x86_64.tar.gz && mv verus-cli bin'
@@ -143,9 +147,6 @@
       become: yes
       become_user: verus
       when: '{{ verify_response.result == true }}'
-
-    - meta: end_play
-      when: '{{ verify_response.result != true }}'
 
     - name: Add bin to bashrc
       shell: 'echo "export PATH=\${PATH}:/home/verus/bin" >> /home/verus/.bashrc'
