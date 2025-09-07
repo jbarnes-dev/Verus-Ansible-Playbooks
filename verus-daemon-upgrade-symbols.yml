@@ -104,7 +104,18 @@
 
       - name: Restart verus daemon
         shell: |
+          cd /home/verus/
           ulimit -Sc unlimited
-          nohup "{{ verus_executable_dir }}/verusd" -daemon &>/dev/null &
+          "{{ verus_executable_dir }}/verusd" -daemon &>/dev/null
         args:
           executable: /bin/bash
+
+      - name: Wait for verus RPC to be ready
+        shell: |
+          "{{ verus_executable_dir }}/verus" -rpcwait getinfo >/dev/null 2>&1
+        register: verus_rpc_ready
+        retries: 30
+        delay: 2
+        until: verus_rpc_ready.rc == 0
+        changed_when: false
+        failed_when: false
