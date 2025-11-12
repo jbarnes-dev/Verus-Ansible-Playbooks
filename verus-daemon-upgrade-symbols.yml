@@ -56,7 +56,7 @@
           Upgrade needed={{ upgrade_needed }}
 
     - name: Skip when up to date
-      meta: end_play
+      meta: end_host
       when: not upgrade_needed
 
     - name: Download the latest release
@@ -104,6 +104,7 @@
 
       - name: Restart verus daemon
         shell: |
+          sleep 5 # quick fix in case of latency of process stopping
           cd /home/verus/
           ulimit -Sc unlimited
           "{{ verus_executable_dir }}/verusd" -daemon &>/dev/null
