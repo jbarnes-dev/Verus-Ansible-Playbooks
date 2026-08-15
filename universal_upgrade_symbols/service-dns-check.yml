@@ -1,0 +1,110 @@
+---
+# This task file re-includes itself after the configured delay while DNS is
+# unsafe, stopping when the records are clear or max checks is reached.
+
+- name: Reset public DNS results for this attempt
+  set_fact:
+    service_dns_blockers: []
+    service_dns_query_errors: []
+  when: not (service_dns_clear | bool)
+
+- name: Query Google Public DNS for service endpoints
+  uri:
+    url: >-
+      {{ service_dns_resolver_url }}?name={{ item | urlencode }}&type={{ service_dns_record_type }}
+    method: GET
+    headers:
+      Accept: application/dns-json
+    return_content: true
+    status_code: 200
+    use_proxy: "{{ service_dns_use_proxy | bool }}"
+  loop: "{{ service_dns_endpoints }}"
+  loop_control:
+    label: "{{ item }}"
+  register: service_dns_query_results
+  changed_when: false
+  failed_when: false
+  delegate_to: localhost
+  become: false
+  when: not (service_dns_clear | bool)
+
+- name: Collect endpoints that still contain the target IP
+  set_fact:
+    service_dns_blockers: >-
+      {{ service_dns_blockers +
+         ([{'endpoint': item.item, 'addresses': service_dns_answer_addresses}]
+          if (service_dns_target_ip | string) in service_dns_answer_addresses
+          else []) }}
+    service_dns_query_errors: >-
+      {{ service_dns_query_errors +
+         ([{'endpoint': item.item,
+            'http_status': item.status | default('unavailable'),
+            'dns_status': (item.json | default({})).Status | default('unavailable')}]
+          if not (service_dns_query_succeeded | bool)
+          else []) }}
+  vars:
+    service_dns_answer_addresses: >-
+      {{ (item.json | default({})).Answer | default([])
+         | selectattr('type', 'defined')
+         | selectattr('type', 'equalto', service_dns_record_number | int)
+         | selectattr('data', 'defined')
+         | map(attribute='data')
+         | list }}
+    service_dns_query_succeeded: >-
+      {{ (item.status | default(0) | int == 200) and
+         ((item.json | default({})).Status | default(-1) | int in [0, 3]) }}
+  loop: "{{ service_dns_query_results.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: not (service_dns_clear | bool)
+
+- name: Show service endpoints that are not safe to upgrade
+  debug:
+    msg:
+      attempt: "{{ service_dns_attempt }}/{{ service_dns_max_checks }}"
+      target_ip: "{{ service_dns_target_ip }}"
+      endpoints_still_in_dns: "{{ service_dns_blockers }}"
+      resolver_query_errors: "{{ service_dns_query_errors }}"
+  when:
+    - not (service_dns_clear | bool)
+    - service_dns_blockers | length > 0 or service_dns_query_errors | length > 0
+
+- name: Mark service DNS as clear
+  set_fact:
+    service_dns_clear: true
+    service_dns_cleared_on_attempt: "{{ service_dns_attempt }}"
+  when:
+    - not (service_dns_clear | bool)
+    - service_dns_blockers | length == 0
+    - service_dns_query_errors | length == 0
+
+- name: Confirm that service endpoints are out of public DNS
+  debug:
+    msg: >-
+      No endpoint in {{ service_dns_file }} resolves to
+      {{ service_dns_target_ip }} through Google Public DNS. The upgrade may proceed.
+  when:
+    - service_dns_clear | bool
+    - service_dns_cleared_on_attempt | int == service_dns_attempt | int
+
+- name: Decide whether another public DNS check is available
+  set_fact:
+    service_dns_retry_needed: >-
+      {{ not (service_dns_clear | bool) and
+         (service_dns_attempt | int < service_dns_max_checks | int) }}
+
+- name: Pause before checking public DNS again
+  wait_for:
+    timeout: "{{ service_dns_retry_delay | int }}"
+  delegate_to: localhost
+  become: false
+  when: service_dns_retry_needed | bool
+
+- name: Advance the public DNS check attempt
+  set_fact:
+    service_dns_attempt: "{{ service_dns_attempt | int + 1 }}"
+  when: service_dns_retry_needed | bool
+
+- name: Check public DNS again
+  include_tasks: service-dns-check.yml
+  when: service_dns_retry_needed | bool

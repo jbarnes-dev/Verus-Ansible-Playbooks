@@ -1,0 +1,135 @@
+---
+- name: Validate PBaaS lifecycle settings
+  assert:
+    that:
+      - pbaas_chains | length > 0
+      - pbaas_stop_retries | int > 0
+      - pbaas_stop_delay | int > 0
+      - pbaas_rpc_retries | int > 0
+      - pbaas_rpc_delay | int > 0
+    fail_msg: PBaaS chain and retry settings must contain positive values.
+
+- name: Initialize candidate and installed PBaaS instances
+  set_fact:
+    pbaas_candidate_instances: []
+    pbaas_instances: []
+
+- name: Validate managed PBaaS chain names
+  assert:
+    that:
+      - item is match('^[A-Za-z0-9_-]+$')
+    fail_msg: "Invalid PBaaS chain name: {{ item }}"
+  loop: "{{ pbaas_chains }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Resolve PBaaS chain identifiers
+  become_user: "{{ verus_user }}"
+  command:
+    argv:
+      - "{{ verus_executable_dir }}/verus"
+      - "-datadir={{ verus_data_dir }}"
+      - getvdxfid
+      - "{{ item }}@"
+  loop: "{{ pbaas_chains }}"
+  loop_control:
+    label: "{{ item }}"
+  register: pbaas_identifier_results
+  changed_when: false
+
+- name: Build candidate PBaaS instance definitions
+  set_fact:
+    pbaas_candidate_instances: >-
+      {{ (pbaas_candidate_instances | default([])) +
+         [{'name': item.item,
+           'id': (item.stdout | from_json).hash160result,
+           'conf': pbaas_data_dir ~ '/' ~
+                   (item.stdout | from_json).hash160result ~ '/' ~
+                   (item.stdout | from_json).hash160result ~ '.conf'}] }}
+  loop: "{{ pbaas_identifier_results.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Validate resolved PBaaS identifiers
+  assert:
+    that:
+      - item.id is match('^[0-9A-Fa-f]{40}$')
+    fail_msg: >-
+      {{ item.name }} returned an invalid PBaaS identifier: {{ item.id }}.
+      No daemons have been stopped.
+  loop: "{{ pbaas_candidate_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Check candidate PBaaS configuration files
+  stat:
+    path: "{{ item.conf }}"
+  loop: "{{ pbaas_candidate_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: pbaas_config_stats
+
+- name: Select installed PBaaS instances
+  set_fact:
+    pbaas_instances: "{{ pbaas_instances + [item.item] }}"
+  loop: "{{ pbaas_config_stats.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when:
+    - item.stat.exists | default(false) | bool
+    - item.stat.isreg | default(false) | bool
+
+- name: Show PBaaS chains that are not installed on this host
+  debug:
+    msg: >-
+      Skipping {{ item.item.name }} because no regular configuration file exists
+      at {{ item.item.conf }}.
+  loop: "{{ pbaas_config_stats.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  when: >-
+    not (item.stat.exists | default(false) | bool) or
+    not (item.stat.isreg | default(false) | bool)
+
+- name: Show installed PBaaS chains selected for lifecycle management
+  debug:
+    msg: >-
+      {{ (pbaas_instances | map(attribute='name') | list)
+         if (pbaas_instances | length > 0)
+         else 'No configured PBaaS chains are installed; PBaaS lifecycle tasks will be skipped.' }}
+
+- name: Stop managed PBaaS daemons if running
+  become_user: "{{ verus_user }}"
+  shell: |
+    if pgrep -f -- '[v]erusd.*-chain={{ item.name }}([[:space:]]|$)' >/dev/null 2>&1; then
+      "{{ verus_executable_dir }}/verus" \
+        -datadir="{{ pbaas_data_dir }}" \
+        -chain="{{ item.name }}" \
+        -conf="{{ item.conf }}" stop
+      echo STOP_REQUESTED
+    else
+      echo NOT_RUNNING
+    fi
+  args:
+    executable: /bin/bash
+  loop: "{{ pbaas_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: pbaas_stop_results
+  changed_when: "'STOP_REQUESTED' in pbaas_stop_results.stdout"
+
+- name: Wait for managed PBaaS daemons to stop
+  become_user: "{{ verus_user }}"
+  shell: >-
+    pgrep -f -- '[v]erusd.*-chain={{ item.name }}([[:space:]]|$)'
+  args:
+    executable: /bin/bash
+  loop: "{{ pbaas_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: pbaas_process_state
+  until: pbaas_process_state.rc != 0
+  retries: "{{ pbaas_stop_retries | int }}"
+  delay: "{{ pbaas_stop_delay | int }}"
+  changed_when: false
+  failed_when: pbaas_process_state.rc == 0

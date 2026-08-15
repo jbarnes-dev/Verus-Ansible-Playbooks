@@ -1,0 +1,41 @@
+---
+- name: Start all managed PBaaS daemons
+  become_user: "{{ verus_user }}"
+  command:
+    argv:
+      - "{{ verus_executable_dir }}/verusd"
+      - "-datadir={{ pbaas_data_dir }}"
+      - "-chain={{ item.name }}"
+      - "-conf={{ item.conf }}"
+      - -daemon
+  loop: "{{ pbaas_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  changed_when: true
+
+- name: Wait for every managed PBaaS RPC to be ready
+  become_user: "{{ verus_user }}"
+  command:
+    argv:
+      - "{{ verus_executable_dir }}/verus"
+      - "-datadir={{ pbaas_data_dir }}"
+      - "-chain={{ item.name }}"
+      - "-conf={{ item.conf }}"
+      - getinfo
+  loop: "{{ pbaas_instances }}"
+  loop_control:
+    label: "{{ item.name }}"
+  register: pbaas_rpc_result
+  until: pbaas_rpc_result.rc == 0
+  retries: "{{ pbaas_rpc_retries | int }}"
+  delay: "{{ pbaas_rpc_delay | int }}"
+  changed_when: false
+
+- name: Show recovered PBaaS chain status
+  debug:
+    msg: >-
+      {{ item.item.name }} RPC is ready at block
+      {{ (item.stdout | from_json).blocks }}.
+  loop: "{{ pbaas_rpc_result.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"

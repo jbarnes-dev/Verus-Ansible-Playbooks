@@ -1,0 +1,78 @@
+---
+- name: Wait for the lightwalletd process
+  shell: "pgrep -f -- '{{ lightwalletd_process_pattern }}'"
+  args:
+    executable: /bin/bash
+  register: lightwalletd_process_result
+  until: lightwalletd_process_result.rc == 0
+  retries: "{{ service_health_retries | int }}"
+  delay: "{{ service_health_delay | int }}"
+  changed_when: false
+
+- name: Wait for lightwalletd to catch up with verusd
+  become_user: "{{ verus_user }}"
+  shell: |
+    set -o pipefail
+    daemon_height=$("{{ verus_executable_dir }}/verus" \
+      -datadir="{{ verus_data_dir }}" getblockcount) || exit 1
+    lightwallet_height=$(tail -n 1 "{{ lightwalletd_log }}" | \
+      jq -er '.msg' | awk -F ': ' '{print $2 - 1}') || exit 1
+
+    if [[ ! "$lightwallet_height" =~ ^[0-9]+$ || ! "$daemon_height" =~ ^[0-9]+$ ]]; then
+      echo "Invalid heights: lightwalletd=$lightwallet_height daemon=$daemon_height"
+      exit 1
+    fi
+
+    delta=$((lightwallet_height - daemon_height))
+    (( delta < 0 )) && delta=$((-delta))
+    echo "lightwalletd height=$lightwallet_height daemon height=$daemon_height delta=$delta"
+    (( delta <= {{ service_sync_height_tolerance | int }} ))
+  args:
+    executable: /bin/bash
+  register: lightwalletd_sync_result
+  until: lightwalletd_sync_result.rc == 0
+  retries: "{{ service_health_retries | int }}"
+  delay: "{{ service_health_delay | int }}"
+  changed_when: false
+
+- name: Wait for the ElectrumX process
+  shell: "pgrep -f -- '{{ electrum_process_pattern }}'"
+  args:
+    executable: /bin/bash
+  register: electrum_process_result
+  until: electrum_process_result.rc == 0
+  retries: "{{ service_health_retries | int }}"
+  delay: "{{ service_health_delay | int }}"
+  changed_when: false
+
+- name: Wait for the ElectrumX database to match its daemon
+  become_user: "{{ verus_user }}"
+  shell: |
+    set -o pipefail
+    electrum_info=$("{{ electrum_rpc_command }}" \
+      -p "{{ electrum_rpc_port | int }}" getinfo) || exit 1
+    database_height=$(printf '%s' "$electrum_info" | jq -er '."db height"') || exit 1
+    daemon_height=$(printf '%s' "$electrum_info" | jq -er '."daemon height"') || exit 1
+
+    if [[ ! "$database_height" =~ ^[0-9]+$ || ! "$daemon_height" =~ ^[0-9]+$ ]]; then
+      echo "Invalid heights: electrum=$database_height daemon=$daemon_height"
+      exit 1
+    fi
+
+    delta=$((database_height - daemon_height))
+    (( delta < 0 )) && delta=$((-delta))
+    echo "ElectrumX height=$database_height daemon height=$daemon_height delta=$delta"
+    (( delta <= {{ service_sync_height_tolerance | int }} ))
+  args:
+    executable: /bin/bash
+  register: electrum_sync_result
+  until: electrum_sync_result.rc == 0
+  retries: "{{ service_health_retries | int }}"
+  delay: "{{ service_health_delay | int }}"
+  changed_when: false
+
+- name: Confirm lightwallet service recovery
+  debug:
+    msg:
+      lightwalletd: "{{ lightwalletd_sync_result.stdout }}"
+      electrumx: "{{ electrum_sync_result.stdout }}"

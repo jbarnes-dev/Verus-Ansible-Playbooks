@@ -1,0 +1,286 @@
+###
+#
+# Ansible playbook to perform a daemon upgrade
+#
+###
+
+- name: Verus Node Upgrade Playbook
+  hosts: verus_nodes
+  become: true
+  # Each host advances independently. The inventory file (or --limit) defines
+  # the manually selected set, while --forks controls its maximum concurrency.
+  strategy: free
+
+  # Role defaults have Ansible's lowest variable precedence, allowing service
+  # groups and individual hosts in inventory to override every setting.
+  roles:
+    - role: verus_upgrade_defaults
+
+  tasks:
+    - name: Determine currently installed version of verusd
+      become_user: "{{ verus_user }}"
+      shell: |
+        set -o pipefail
+        "{{ verus_executable_dir }}/verusd" --version 2>/dev/null | head -n1 | cut -f4 -d" "
+      args:
+        executable: /bin/bash
+      register: current_verusd_version_raw
+      changed_when: false
+
+    - name: Normalize current version
+      set_fact:
+        current_verusd_version: "{{ current_verusd_version_raw.stdout }}"
+
+    - name: Require a version when GitHub release discovery is disabled
+      assert:
+        that:
+          - verus_version | trim | length > 0
+        fail_msg: >-
+          verus_version must be set when git=false (for example,
+          -e git=false -e verus_version=v1.2.3).
+      when: not (git | bool)
+
+    - name: Fetch latest release metadata from GitHub
+      uri:
+        url: "https://api.github.com/repos/{{ github_repo }}/releases/latest"
+        method: GET
+        return_content: true
+      register: git_release_response
+      when: git | bool
+
+    - name: Select the requested release
+      set_fact:
+        target_release: >-
+          {{ git_release_response.json.tag_name
+             if (git | bool)
+             else (verus_version | trim) }}
+
+    - name: Validate the requested release name
+      assert:
+        that:
+          - target_release | length > 0
+          - target_release is match('^[A-Za-z0-9][A-Za-z0-9._+-]*$')
+        fail_msg: >-
+          The selected release '{{ target_release }}' is empty or contains
+          characters that are not valid in a symbuild artifact name.
+
+    - name: Compare GitHub release to the installed version
+      set_fact:
+        upgrade_needed: >-
+          {{ (target_release | regex_replace('^v', '') | string)
+             is version((current_verusd_version | regex_replace('^v', '') | string), 'gt') }}
+      when: git | bool
+
+    - name: Compare manually requested release to the installed version
+      set_fact:
+        upgrade_needed: >-
+          {{ (target_release | regex_replace('^v', '')) !=
+             (current_verusd_version | regex_replace('^v', '')) }}
+      when: not (git | bool)
+
+    - name: Show version status
+      debug:
+        msg: >-
+          Current={{ current_verusd_version }}, Target={{ target_release }},
+          Source={{ 'GitHub latest release' if (git | bool) else 'manual version' }},
+          Upgrade needed={{ upgrade_needed }}
+
+    - name: Skip when up to date
+      meta: end_host
+      when: not upgrade_needed
+
+    - name: Read service DNS endpoints from the controller
+      set_fact:
+        service_dns_file_lines: >-
+          {{ lookup('ansible.builtin.file', service_dns_file).splitlines() }}
+        service_dns_endpoints: []
+      when: service_dns_check | bool
+
+    - name: Build the service DNS endpoint list
+      set_fact:
+        service_dns_endpoints: >-
+          {{ (service_dns_endpoints | default([])) +
+             [item | trim
+                   | regex_replace('^[-*+]\\s+', '')
+                   | regex_replace('^[A-Za-z][A-Za-z0-9+.-]*://', '')
+                   | regex_replace('[/?#].*$', '')
+                   | regex_replace(':\\d+$', '')
+                   | regex_replace('\\.$', '')] }}
+      loop: "{{ service_dns_file_lines | default([]) }}"
+      when:
+        - service_dns_check | bool
+        - item | trim | length > 0
+        - not (item | trim).startswith('#')
+        - not (item | trim).startswith('<!--')
+
+    - name: Validate service DNS endpoint names
+      assert:
+        that:
+          - item | length > 0
+          - item is match('^[A-Za-z0-9_][A-Za-z0-9_.-]*$')
+        fail_msg: >-
+          '{{ item }}' is not a valid service DNS hostname. Put one hostname or
+          URL per non-comment line in {{ service_dns_file }}.
+      loop: "{{ service_dns_endpoints | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      when: service_dns_check | bool
+
+    - name: Validate the public service target IP
+      command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -c
+          - "import ipaddress, sys; ipaddress.ip_address(sys.argv[1])"
+          - "{{ service_dns_target_ip }}"
+      register: service_dns_ip_validation
+      changed_when: false
+      failed_when: false
+      delegate_to: localhost
+      become: false
+      when:
+        - service_dns_check | bool
+        - service_dns_endpoints | default([]) | length > 0
+
+    - name: Validate service DNS safety-check settings
+      assert:
+        that:
+          - service_dns_ip_validation.rc == 0
+          - service_dns_retry_delay | int >= 1
+          - service_dns_max_checks | int >= 1
+        fail_msg: >-
+          DNS safety-check settings are invalid. service_dns_target_ip must be
+          an IP address; override it when ansible_host is a hostname or is not
+          the node's public service IP.
+      when:
+        - service_dns_check | bool
+        - service_dns_endpoints | default([]) | length > 0
+
+    - name: Initialize service DNS safety-check state
+      set_fact:
+        service_dns_clear: false
+        service_dns_attempt: 1
+        service_dns_record_type: "{{ 'AAAA' if ':' in (service_dns_target_ip | string) else 'A' }}"
+        service_dns_record_number: "{{ 28 if ':' in (service_dns_target_ip | string) else 1 }}"
+      when:
+        - service_dns_check | bool
+        - service_dns_endpoints | default([]) | length > 0
+
+    - name: Wait for service endpoints to leave public DNS
+      include_tasks: service-dns-check.yml
+      when:
+        - service_dns_check | bool
+        - service_dns_endpoints | default([]) | length > 0
+
+    - name: Stop the upgrade when service endpoints remain in public DNS
+      fail:
+        msg: >-
+          Refusing to upgrade {{ inventory_hostname }}. After
+          {{ service_dns_max_checks }} checks, one or more service endpoints
+          still resolve to {{ service_dns_target_ip }}, or the public DNS
+          resolver could not be queried. See the preceding DNS check output.
+      when:
+        - service_dns_check | bool
+        - service_dns_endpoints | default([]) | length > 0
+        - not (service_dns_clear | bool)
+
+    - name: Download the selected release
+      get_url:
+        url: "{{ ext_base_url }}/Verus-CLI-Linux-{{ target_release }}-x86_64-WithSymbols.tar.gz"
+        dest: "/home/verus/"
+      become: true
+      become_user: verus
+
+    - name: Stop managed PBaaS chains before replacing verusd
+      include_tasks: pbaas-stop.yml
+      when: manage_pbaas_chains | bool
+
+    - name: Stop verus daemon if running
+      become_user: "{{ verus_user }}"
+      shell: |
+        if pgrep -x verusd >/dev/null 2>&1; then
+          "{{ verus_executable_dir }}/verus" -datadir="{{ verus_data_dir }}" stop || true
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Wait until verus daemon is fully stopped
+      become_user: "{{ verus_user }}"
+      shell: |
+        if pgrep -x verusd >/dev/null 2>&1; then
+          echo RUNNING
+        else
+          echo STOPPED
+        fi
+      args:
+        executable: /bin/bash
+      register: verusd_state
+      retries: 30
+      delay: 2
+      until: verusd_state.stdout.strip() == "STOPPED"
+      changed_when: false
+      failed_when: verusd_state.stdout.strip() != "STOPPED"
+
+    - name: Proceed with extraction
+      shell: |
+        set -euo pipefail
+        archive="{{ verus_home }}/Verus-CLI-Linux-{{ target_release }}-x86_64-WithSymbols.tar.gz"
+        tar -xzvf "$archive"
+        mv verus-cli/verusd "{{ verus_executable_dir }}/verusd"
+        mv verus-cli/verus "{{ verus_executable_dir }}/verus"
+        rm -rf verus-cli
+        rm -f "$archive"
+      args:
+        chdir: "{{ verus_home }}"
+        executable: /bin/bash
+      become: true
+      become_user: verus
+    #  when: '{{ verify_response.result == true }}'
+
+    - name: Restart verus daemon
+      become_user: "{{ verus_user }}"
+      shell: |
+        sleep 5
+        cd "{{ verus_home }}"
+        ulimit -Sc unlimited
+        "{{ verus_executable_dir }}/verusd" -datadir="{{ verus_data_dir }}" -daemon
+      args:
+        executable: /bin/bash
+
+    - name: Start coinsupply in parallel with daemon recovery
+      include_tasks: coinsupply-start.yml
+      when: run_coinsupply | bool
+
+    - name: Wait for verus RPC to be ready
+      become_user: "{{ verus_user }}"
+      command:
+        argv:
+          - "{{ verus_executable_dir }}/verus"
+          - "-datadir={{ verus_data_dir }}"
+          - -rpcwait
+          - getinfo
+      register: verus_rpc_ready
+      retries: 30
+      delay: 2
+      until: verus_rpc_ready.rc == 0
+      changed_when: false
+
+    - name: Restart managed PBaaS chains and wait for their RPCs
+      include_tasks: pbaas-start.yml
+      when: manage_pbaas_chains | bool
+
+    - name: Wait for coinsupply to finish
+      include_tasks: coinsupply-wait.yml
+      when: run_coinsupply | bool
+
+    - name: Verify the internal API service
+      include_tasks: health-api.yml
+      when: check_api_service | bool
+
+    - name: Verify the Insight explorer service
+      include_tasks: health-insight.yml
+      when: check_insight_service | bool
+
+    - name: Verify lightwalletd and ElectrumX services
+      include_tasks: health-lightwallet.yml
+      when: check_lightwallet_services | bool

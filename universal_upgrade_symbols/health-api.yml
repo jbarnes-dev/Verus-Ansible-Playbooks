@@ -1,0 +1,49 @@
+---
+- name: Wait for the internal API to return the known block
+  uri:
+    url: "{{ api_health_url }}"
+    method: POST
+    headers:
+      Content-Type: text/plain
+    body:
+      jsonrpc: "1.0"
+      id: ansible-healthcheck
+      method: getblock
+      params:
+        - "{{ api_health_block_height | int }}"
+    body_format: json
+    return_content: true
+    status_code: 200
+    use_proxy: "{{ api_health_use_proxy | bool }}"
+  register: api_health_result
+  until: >-
+    (api_health_result.status | default(0) | int == 200) and
+    (((api_health_result.json | default({})).result | default({})).hash |
+     default('') == api_health_expected_hash)
+  retries: "{{ service_health_retries | int }}"
+  delay: "{{ service_health_delay | int }}"
+  changed_when: false
+  failed_when: false
+
+- name: Show the failed internal API response
+  debug:
+    var: api_health_result
+  when: >-
+    (api_health_result.status | default(0) | int != 200) or
+    (((api_health_result.json | default({})).result | default({})).hash |
+     default('') != api_health_expected_hash)
+
+- name: Require the internal API health check to pass
+  assert:
+    that:
+      - api_health_result.status | default(0) | int == 200
+      - >-
+        ((api_health_result.json | default({})).result | default({})).hash |
+        default('') == api_health_expected_hash
+    fail_msg: >-
+      The internal API at {{ api_health_url }} did not return the expected hash
+      for block {{ api_health_block_height }}.
+
+- name: Confirm internal API recovery
+  debug:
+    msg: "Internal API health check passed at {{ api_health_url }}."

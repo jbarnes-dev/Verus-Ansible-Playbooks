@@ -1,0 +1,26 @@
+---
+- name: Wait for the asynchronous coinsupply job
+  become_user: "{{ verus_user }}"
+  async_status:
+    jid: "{{ coinsupply_async_job.ansible_job_id }}"
+  register: coinsupply_async_result
+  until: coinsupply_async_result.finished | bool
+  retries: >-
+    {{ ((coinsupply_async_timeout | int) //
+        (coinsupply_poll_interval | int)) + 1 }}
+  delay: "{{ coinsupply_poll_interval | int }}"
+  changed_when: false
+  failed_when: false
+
+- name: Require coinsupply to complete successfully
+  assert:
+    that:
+      - coinsupply_async_result.finished | bool
+      - coinsupply_async_result.rc | default(1) | int == 0
+    fail_msg: >-
+      coinsupply did not complete successfully within
+      {{ coinsupply_async_timeout }} seconds. Result={{ coinsupply_async_result }}
+
+- name: Confirm coinsupply completion
+  debug:
+    msg: coinsupply completed successfully.

@@ -1,0 +1,4 @@
+---
+# The upgrade workflow remains in the top-level playbook. This role exists to
+# give its defaults lower precedence than inventory variables.
+[]

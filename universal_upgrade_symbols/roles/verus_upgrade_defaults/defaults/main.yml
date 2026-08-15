@@ -1,0 +1,68 @@
+---
+# These role defaults deliberately use Ansible's lowest variable precedence.
+# Inventory groups, host variables, and --extra-vars can override every value.
+
+verus_user: verus
+verus_home: "/home/verus"
+verus_executable_dir: "/home/verus/bin"
+
+# Set git=false and provide verus_version to install a release that is not
+# published on GitHub. For example:
+#   -e git=false -e verus_version=v1.2.3
+git: true
+verus_version: ""
+github_repo: "veruscoin/veruscoin"
+os_keyword: "linux"
+arch_keywords: ["amd64", "x86_64"]
+ext_base_url: "https://symbuild.verus.io"
+verify_with_local_daemon: true
+
+# service-dns.md is read on the Ansible controller. service_dns_target_ip can
+# be overridden per host when the public service IP differs from ansible_host.
+service_dns_check: true
+service_dns_file: "{{ playbook_dir }}/service-dns.md"
+service_dns_target_ip: "{{ ansible_host | default(ansible_default_ipv4.address) }}"
+service_dns_resolver_url: "https://dns.google/resolve"
+service_dns_use_proxy: true
+service_dns_retry_delay: 300  # seconds (five minutes)
+service_dns_max_checks: 60
+
+# Optional service-node workflows. Inventory service groups enable the
+# capabilities present on each host.
+run_coinsupply: false
+manage_pbaas_chains: false
+check_api_service: false
+check_insight_service: false
+check_lightwallet_services: false
+
+verus_data_dir: "{{ verus_home }}/.komodo/VRSC"
+coinsupply_async_timeout: 14400
+# Check asynchronous coinsupply completion every five minutes.
+coinsupply_poll_interval: 300
+
+pbaas_data_dir: "{{ verus_home }}/.verus/pbaas"
+# Candidate chains. Each host manages only the chains whose resolved
+# configuration file exists under pbaas_data_dir.
+pbaas_chains: ["vARRR", "vDEX", "CHIPS"]
+pbaas_stop_retries: 60
+pbaas_stop_delay: 2
+pbaas_rpc_retries: 120
+pbaas_rpc_delay: 10
+
+service_health_retries: 60
+service_health_delay: 10
+service_sync_height_tolerance: 2
+
+api_health_url: "http://127.0.0.1:3045"
+api_health_use_proxy: false
+api_health_block_height: 1337
+api_health_expected_hash: "0000000000e1373d9c645c5a77376fe36b69c77180962414ebbf2e63c115d85e"
+
+insight_health_url: "http://127.0.0.1:3002/api/getblockcount"
+service_http_timeout: 30
+
+lightwalletd_log: "/home/lightwalletd/lightwallet.log"
+lightwalletd_process_pattern: "[/]lightwalletd([[:space:]]|$)"
+electrum_process_pattern: "[e]lectrumx"
+electrum_rpc_command: "electrumx_rpc"
+electrum_rpc_port: 17489

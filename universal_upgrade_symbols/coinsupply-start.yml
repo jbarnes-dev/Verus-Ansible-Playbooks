@@ -1,0 +1,27 @@
+---
+- name: Validate coinsupply timing settings
+  assert:
+    that:
+      - coinsupply_async_timeout | int > 0
+      - coinsupply_poll_interval | int > 0
+    fail_msg: coinsupply timeout and polling interval must be positive integers.
+
+- name: Run coinsupply asynchronously
+  become_user: "{{ verus_user }}"
+  command:
+    argv:
+      - "{{ verus_executable_dir }}/verus"
+      - "-datadir={{ verus_data_dir }}"
+      - -rpcwait
+      - coinsupply
+  async: "{{ coinsupply_async_timeout | int }}"
+  poll: 0
+  register: coinsupply_async_job
+  changed_when: true
+
+- name: Show asynchronous coinsupply job
+  debug:
+    msg: >-
+      coinsupply is running in parallel as Ansible job
+      {{ coinsupply_async_job.ansible_job_id }}. The play will wait for it
+      before running service health checks.

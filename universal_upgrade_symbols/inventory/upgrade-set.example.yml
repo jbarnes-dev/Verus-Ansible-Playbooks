@@ -1,0 +1,34 @@
+---
+# Copy this file for each manually controlled upgrade set and replace the
+# documentation-only TEST-NET addresses with the real node addresses.
+#
+# A set may contain any number or mix of service types. Keep --forks at least
+# as large as the number of hosts when every host should run concurrently.
+
+verus_nodes:
+  children:
+    lightwallet_nodes:
+      hosts:
+        lightwallet-01:
+          ansible_host: 192.0.2.11
+          # Set this when DNS points at a different public address.
+          # service_dns_target_ip: 198.51.100.11
+      vars:
+        check_lightwallet_services: true
+
+    explorer_nodes:
+      hosts:
+        explorer-01:
+          ansible_host: 192.0.2.12
+      vars:
+        run_coinsupply: true
+        check_insight_service: true
+
+    api_nodes:
+      hosts:
+        api-01:
+          ansible_host: 192.0.2.13
+      vars:
+        run_coinsupply: true
+        manage_pbaas_chains: true
+        check_api_service: true

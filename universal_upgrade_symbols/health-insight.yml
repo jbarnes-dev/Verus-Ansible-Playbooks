@@ -1,0 +1,30 @@
+---
+- name: Wait for Insight to be operational and in sync
+  become_user: "{{ verus_user }}"
+  shell: |
+    set -o pipefail
+    insight_height=$(curl --fail --silent --max-time "{{ service_http_timeout | int }}" \
+      "{{ insight_health_url }}") || exit 1
+    daemon_height=$("{{ verus_executable_dir }}/verus" \
+      -datadir="{{ verus_data_dir }}" getblockcount) || exit 1
+
+    if [[ ! "$insight_height" =~ ^[0-9]+$ || ! "$daemon_height" =~ ^[0-9]+$ ]]; then
+      echo "Invalid heights: insight=$insight_height daemon=$daemon_height"
+      exit 1
+    fi
+
+    delta=$((insight_height - daemon_height))
+    (( delta < 0 )) && delta=$((-delta))
+    echo "Insight height=$insight_height daemon height=$daemon_height delta=$delta"
+    (( delta <= {{ service_sync_height_tolerance | int }} ))
+  args:
+    executable: /bin/bash
+  register: insight_health_result
+  until: insight_health_result.rc == 0
+  retries: "{{ service_health_retries | int }}"
+  delay: "{{ service_health_delay | int }}"
+  changed_when: false
+
+- name: Confirm Insight recovery
+  debug:
+    msg: "{{ insight_health_result.stdout }}"
