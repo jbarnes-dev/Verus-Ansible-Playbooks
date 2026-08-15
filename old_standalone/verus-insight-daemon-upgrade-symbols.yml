@@ -1,0 +1,71 @@
+#####
+#
+# Playbook to upgrade insight nodes daemon using symbols build
+#
+####
+
+
+- hosts: your_targets
+  gather_facts: false
+
+  vars:
+    domains_to_check:
+      - sub.domain.tld
+      - other.example.org
+    # How many times to re-check if a domain is still active (1 min between tries)
+    max_checks: 60            # 60 minutes total
+    dns_recheck_delay: 60     # seconds
+
+  tasks:
+    - name: Gate operations until domains don't point at this host
+      vars:
+        check_script: |
+          set -e
+          domain="{{ item }}"
+
+          # Get this host's IPs (IPv4 + global IPv6)
+          myips="$(
+            ip -o -4 addr show up | awk '{print $4}' | cut -d/ -f1
+          )
+          $(ip -o -6 addr show scope global up | awk '{print $4}' | cut -d/ -f1)"
+
+          # Resolve A and AAAA; keep only IP-looking lines (filters out CNAMEs)
+          dnsips="$(
+            { dig +short "$domain" A; dig +short "$domain" AAAA; } \
+            | grep -E '^[0-9A-Fa-f:.]+$' || true
+          )"
+
+          echo "Host IPs: $myips"
+          echo "DNS IPs for $domain: $dnsips"
+
+          active=0
+          hit=""
+          for ip in $dnsips; do
+            for me in $myips; do
+              if [ "$ip" = "$me" ]; then
+                active=1
+                hit="$ip"
+                break 2
+              fi
+            done
+          done
+
+          if [ "$active" -eq 1 ]; then
+            echo "$domain is ACTIVE on this host (matched $hit). Waiting 60s before rechecking..."
+            sleep 60
+            exit 1    # tell Ansible to retry
+          else
+            echo "$domain is NOT active on this host. Proceeding."
+            exit 0
+          fi
+      ansible.builtin.shell: "bash -lc '{{ check_script | replace(\"'\", \"'\\''\") }}'"
+      register: dns_wait
+      # Retry until the script exits 0 (i.e., domain no longer points here)
+      until: dns_wait.rc == 0
+      retries: "{{ max_checks }}"
+      delay: 0                 # we sleep inside the script to print a message
+      changed_when: false
+      loop: "{{ domains_to_check }}"
+      loop_control:
+        label: "{{ item }}"
+

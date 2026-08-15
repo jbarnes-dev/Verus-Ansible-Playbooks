@@ -1,0 +1,227 @@
+###
+#
+# Ansible playbook to perform a daemon upgrade on testnet, including PBaaS
+#
+###
+
+- name: Verus Node Upgrade Playbook
+  hosts: <hosts>
+  become: true
+  vars:
+    verus_user: verustest
+    verus_home: "/home/verustest"
+    verus_executable_dir: "/home/verustest/bin"
+    verusd_process: verusd
+    git: false
+    github_repo: "veruscoin/veruscoin"
+    os_keyword: "linux"
+    arch_keywords: ["amd64", "x86_64"]
+    ext_base_url: "https://symbuild.verus.io"
+    verify_with_local_daemon: false 
+    ignored_chains: 
+      - VRSCTEST
+      - vrsctest
+
+  tasks:
+    - name: Determine currently installed version of verusd
+      become_user: "{{ verus_user }}"
+      shell: |
+        set -o pipefail
+        "{{ verus_executable_dir }}/verusd" --version 2>/dev/null | head -n1 | cut -f4 -d" "
+      args:
+        executable: /bin/bash
+      register: current_verusd_version_raw
+      changed_when: false
+
+    - name: Normalize current version
+      set_fact:
+        current_verusd_version: "{{ current_verusd_version_raw.stdout }}"
+
+    - name: Fetch latest release metadata from GitHub
+      uri:
+        url: "https://api.github.com/repos/{{ github_repo }}/releases/latest"
+        method: GET
+        return_content: yes
+        force_basic_auth: yes
+      register: git_release_response
+
+    - name: Save the latest release version
+      set_fact:
+        latest_release: "{{ git_release_response.json.tag_name }}"
+
+    - name: Compare to decide if upgrade needed
+      set_fact:
+        upgrade_needed: "{{ (latest_release | regex_replace('^v','') | string) is version((current_verusd_version | regex_replace('^v', '') | string), 'gt') }}"
+
+    - name: Show version status
+      debug:
+        msg: >-
+          Current={{ current_verusd_version }}, Latest={{ latest_release }},
+          Upgrade needed={{ upgrade_needed }}
+
+    - name: Skip when up to date
+      meta: end_play
+      when: not upgrade_needed
+
+    - name: Download the latest release
+      get_url:
+        url: "{{ ext_base_url }}/Verus-CLI-Linux-{{ latest_release }}-x86_64-WithSymbols.tar.gz"
+        dest: "/home/verustest/"
+      become: yes
+      become_user: verustest
+
+    - name: Proceed with extraction
+      shell: 'tar -xzvf /home/verustest/Verus-CLI-Linux-{{ latest_release }}-x86_64-WithSymbols.tar.gz && mv verus-cli/verusd bin/verusd; mv verus-cli/verus bin/verus && rm -rf verus-cli && rm Verus-CLI*'
+      args:
+        chdir:
+          /home/verustest
+      become: yes
+      become_user: verustest
+    #  when: '{{ verify_response.result == true }}'
+
+    - name: Determine PBaaS chains running
+      ansible.builtin.shell: |
+        set -o pipefail
+        pgrep -a -f "{{ verusd_process }}.*-testnet" || true
+      args:
+        executable: /bin/bash
+      register: verus_pbaas_prc_raw
+      changed_when: false
+
+    - name: Normalize chain PS to lines
+      ansible.builtin.set_fact:
+        verus_proc_lines: "{{ (verus_pbaas_prc_raw.stdout | default('')) | trim | split() }}"
+
+    - name: Buld structured list of processes (pid, cmd, chain)
+      ansible.builtin.set_fact:
+        verus_proc_info: "{{ verus_proc_info | default([]) + [ {
+         'chain': (item | regex_search('-chain=([^\\s]+)', '\\1')) 
+        } ] }}"
+      loop: "{{ verus_proc_lines }}"
+      when:
+        - item | length > 0
+        - item is search('-chain=')
+
+    - name: Exclude undesired chains
+      ansible.builtin.set_fact:
+        pbaas_proc_info: >-
+         {{
+           (verus_proc_info | default([]))
+           | rejectattr('chain', 'in', ignored_chains | default([]))
+           | list
+         }}
+    - name: Extract unique chain names
+      ansible.builtin.set_fact:
+        pbaas_chain_list: >-
+         {{ pbaas_proc_info | map(attribute='chain') | list | unique }}
+
+    - name: Verustest stop and restart
+      become_user: "{{ verus_user }}"
+      block:
+      - name: Stop verus daemon if running
+        shell: |
+          if pgrep -fa verusd.*vrsctest >/dev/null 2>&1; then
+            "{{ verus_executable_dir }}/verus -chain=vrsctest" stop || true
+          fi
+        args:
+          executable: /bin/bash
+
+      - name: Wait until verus daemon is fully stopped
+        shell: |
+          if pgrep -fa verusd.*vrsctest >/dev/null 2>&1; then
+            echo RUNNING
+          else
+            echo STOPPED
+          fi
+        args:
+          executable: /bin/bash
+        register: verusd_state
+        retries: 30
+        delay: 2
+        until: verusd_state.stdout.strip() == "STOPPED"
+        changed_when: false
+        failed_when: false  # allow interim "RUNNING" without marking task failed
+
+      - name: Restart verustest daemon
+        shell: |
+          cd "{{ verus_home }}"
+          ulimit -Sc unlimited
+          "{{ verus_executable_dir }}/verusd" -chain=vrsctest -daemon &>/dev/null
+        args:
+          executable: /bin/bash
+
+      - name: Wait for verus RPC to be ready
+        shell: |
+          "{{ verus_executable_dir }}/verus" -chain=vrsctest -rpcwait getinfo >/dev/null 2>&1
+        register: verus_rpc_ready
+        retries: 30
+        delay: 2
+        until: verus_rpc_ready.rc == 0
+        changed_when: false
+        failed_when: false
+
+      - name: Re-enable mining and staking for VRSCTEST
+        shell: | 
+          "{{ verus_executable_dir }}/verus" -chain=vrsctest setgenerate true 0
+          "{{ verus_executable_dir }}/verus" -chain=vrsctest setgenerate true 1
+        args:
+          executable: /bin/bash
+
+    - name: PBaaS stop and restart
+      become_user: "{{ verus_user }}"
+      block:
+      - name: Stop all PBaaS chains
+        shell: |
+          "{{ verus_executable_dir }}"/verus -chain="{{ item[0] }}" -testnet stop
+        loop: "{{ pbaas_chain_list }}"
+      - name: Wait until all PBaaS chains are full stopped
+        shell: | 
+          if pgrep -fa verusd.*"{{ item[0] }}"; then 
+            echo RUNNING
+          else
+            echo STOPPED
+          fi
+        args:
+          executable: /bin/bash
+        register: pbaas_state
+        retries: 30
+        delay: 2
+        until: pbaas_state.stdout.strip() == "STOPPED"
+        changed_when: false
+        failed_when: false
+        loop: "{{ pbaas_chain_list }}"
+
+      - name: Restart PBaaS chains
+        shell: |
+          cd "{{ verus_home }}"
+          ulimit -Sc unlimited
+          "{{ verus_executable_dir }}/verusd" -daemon -testnet -chain="{{ item[0] }}" &>/dev/null
+        args:
+          executable: /bin/bash
+        loop: "{{ pbaas_chain_list }}"
+
+      - name: Wait for PBaaS RPC to be ready
+        shell: |
+          "{{ verus_executable_dir }}/verus" -chain="{{ item[0] }}" -testnet -rpcwait getinfo >/dev/null 2>&1
+        register: pbaas_rpc_ready
+        retries: 30
+        delay: 2
+        until: verus_rpc_ready.rc == 0
+        changed_when: false
+        failed_when: false
+        loop: "{{ pbaas_chain_list }}"
+
+      - name: Re-enable mining and staking for PBaaS chains
+        shell: | 
+          "{{ verus_executable_dir }}/verus" -testnet -chain="{{ item[0] }}" setgenerate true 0
+          "{{ verus_executable_dir }}/verus" -testnet -chain="{{ item[0] }}" setgenerate true 1
+        args:
+          executable: /bin/bash
+        loop: "{{ pbaas_chain_list }}"
+        
+
+
+
+
+
+
